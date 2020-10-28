@@ -1,4 +1,4 @@
-# <P123 This Awesome Project>
+# \<P123 This Awesome Project\>
 ### Author
 ### Investigator
 ### Date
