@@ -1,0 +1,197 @@
+---
+title: "P999 Example Project"
+author: "<Your Name>"
+date: "10/28/2020"
+output: html_document
+# If you use pdf output use the following instead:
+#output: pdf_document
+#header-includes:
+#- \usepackage{booktabs}
+#- \usepackage{makecell}
+---
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+library(knitr)
+library(tidyverse) #loads ggplot2, tidyr, dplyr, stringr
+library(magrittr) # if you use pipes
+library(apird) # API to BRI research databased
+library(readxl)
+library(edgeR)
+library(limma)
+library(ggcorrplot)
+library(ggrepel)
+library(gplots)
+library(ggbiplot)
+library(corrplot)
+library(ComplexHeatmap)
+#library(DGETools) # SRP Volcano
+#library(RNAseQC) # MJD calc_PCcors
+#library(TCRtools) # MJD install_github('mjdufort/TCRtools') # local use of plot_Circos to render into .Rmd
+#library(WGCNA)
+#library(Seurat)
+#library(monocle3)
+
+theme_set(theme_bw(20))
+
+opts_chunk$set(fig.width=6, fig.height=4.25, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE)
+options(stringsAsFactors = FALSE)
+```
+
+```{r globalVariables}
+#Project
+project <- "P999"
+dataDir <- "data"
+resultsDir <- "results"
+normCountsFile = file.path(resultsDir, paste(project, "TMM", "NormCounts.csv", sep="_"))
+
+# QC Cuts
+total_reads_cut = 1
+cut.alignment = 0.75
+cut.medianCV = 0.75
+
+# Stat cuts
+cut.fc   <- 1.25 # volcano
+cut.pval <- 0.1 # volcano
+cut.filter <- 0.10 # filter()
+```
+
+
+# Executive Summary
+
+Fill in some details about the experiment here
+
+```{r loadData}
+# Load Ensembl Gene information
+gene_key <- read.table(file=file.path(dataDir, "EnsemblToHGNC_GRCh38.txt"), header=TRUE, sep="\t", na.strings="")
+
+# Load RNA-seq data from files or using apiRd
+```
+
+## Quality Metrics
+
+### CV vs Percent Aligned
+
+First we take a look at the median CV coverage vs the percent aligned sequences from the reads in the libraries:
+
+```{r cvplot}
+ggplot(metrics, aes(medianCvCoverage, mappedReadsWDups, label=rownames(metrics))) + 
+#  xlim(0.2, 1.5) + ylim(0.4, 1.0) +
+  theme_bw() + geom_point(size=3) +
+  geom_hline(yintercept = cut.alignment, linetype = 2) +
+  geom_vline(xintercept = cut.medianCV, linetype = 2) +
+  xlab("Median CV Coverage") + ylab("Percent Aligned") +
+  ggtitle("P999 QC: CV vs Perc. Aligned.")
+```
+### Aligned Read Counts
+
+Then we can look at the aligned counts per library:
+
+```{r barcounts}
+tcounts <-data.frame(alignedCounts=apply(counts, 2, sum)/1e6)
+
+ggplot(tcounts, aes(reorder(rownames(tcounts), alignedCounts), alignedCounts)) +
+  theme_bw() + geom_bar(stat="identity") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  xlab("Library") + ylab("Aligned Counts / 1e6") +
+  ggtitle("P999 QC: Library Counts")
+```
+
+## Sex Check
+
+```{r sexCheck}
+sextable <- data.frame(libraryId=design$libraryId,
+                       sex=as.character(design$babyGenderC),
+                       y_x_count_ratio=as.numeric(summary$y_x_count_ratio),
+                       log_y_x_count_ratio=-1*log(as.numeric(summary$y_x_count_ratio)))
+sextable <- sextable[complete.cases(sextable),]
+
+ggplot(sextable, aes(x=log_y_x_count_ratio, fill=sex)) + 
+  geom_histogram(bins=20) +
+  scale_fill_manual(values = c("magenta", "navy")) +
+  labs(fill="Reported Sex") +
+  xlab(expression(log[e]~'Y/X Counts')) + ylab("Number of Libraries") +
+  ggtitle("P999 QC: Sex Check")
+```
+
+```{r qcFiltering}
+
+badLibrary <- subset(metrics, medianCvCoverage > cut.medianCV | mappedReadsWDups < cut.alignment)
+badLibraryId <- rownames(badLibrary)
+badOutlierId <- "lib37076"
+badCountId  <- rownames(tcounts[tcounts$alignedCounts < 0.5,])
+filter_set <- c(badLibraryId, badCountId, badOutlierId)
+
+filteredCounts  <- counts[, -which(names(counts) %in% filter_set)]
+filteredMetrics <- metrics[-which(rownames(metrics) %in% filter_set), ]
+filteredSummary <- summary[-which(rownames(summary) %in% filter_set), ]
+filteredDesign  <- design[-which(design$libraryId %in% filter_set), ]
+
+```
+
+## Filtering and Normalization
+
+```{r PreliminaryEdgeR}
+# Creating a frame of gene names for use in the DEGList()
+genes_hgnc <- subset(gene_key, !is.na(gene_key$hgnc_symbol)) # keep only Ensembl IDs with valid hgnc symbols.
+genes_pc <- subset(genes_hgnc, gene_biotype == "protein_coding") # keep only protein coding genes
+genes_pc <- subset(genes_pc, !duplicated(subset(genes_pc, select=c(ensembl_gene_id)))) # make unique, there are two duplicated protein coding genes.
+genes_pc <- data.frame(genes_pc[,-1], row.names=genes_pc[,1]) # assign row name to first col; remove first col
+
+# new way - take intersection of fcounts and protein coding genes (gene list rowname must be ensembl_gene_id)
+igenes <- intersect(rownames(filteredCounts), rownames(genes_pc))
+# subset fcounts and genes_pc to filteredGenes
+filteredCounts <- filteredCounts[igenes,]
+filteredGenes  <- genes_pc[igenes, c("hgnc_symbol"), drop=F]
+# and sanity check
+#all(table(rownames(filteredCounts) == filteredGenes$ensembl_gene_id))
+
+d<-DGEList(counts=filteredCounts, genes=filteredGenes)
+d<-calcNormFactors(d)
+keepRows <- rowSums(round(cpm(d$counts)) >= 1) >= cut.filter*ncol(filteredCounts)
+table(keepRows)
+curDGE <-d[keepRows,]
+curDGE <- calcNormFactors(curDGE)
+
+if (!file.exists(normCountsFile)) {
+  normAnnot <- cbind(curDGE$genes, cpm(curDGE))
+  write.csv(normAnnot, file=normCountsFile, quote=F)
+}
+
+```
+## PCA Evaluation
+
+```{r PCASetup}
+normCounts <- cpm(curDGE, log=T)
+pcaResult <- prcomp(t(normCounts))
+# check for coherent row order.
+#all(table(rownames(pcaResult$x) == filteredDesign$libraryId))
+
+pcaSummary <- summary(pcaResult)
+pcaDesign <- cbind(pcaResult$x, filteredDesign, filteredMetrics)
+pcaDesign$label <- paste0("PC", 1:length(pcaSummary$importance[2,]),
+                          " (", round(pcaSummary$importance[2,]*100, 1), "%)")
+
+limitedMetrics <- pcaDesign %>%
+  select(libraryId, cvCoverage=medianCvCoverage, mappedReads=mappedReadsWDups, totalReads=fastqTotalReads,
+         site, studyGroup, treatment)
+
+# From Matt D's RNAseQC package - calculate the correlations between technical and clinical variables and PCs
+pcCors <- RNAseQC::calc_PCcors(pcaResult, limitedMetrics, id_col="libraryId")
+
+ggcorrplot(pcCors, title="P999 PCA Correlates")
+
+#pcCors %>% kable(., caption="Overall Correlates")
+
+```
+
+
+### PCA by MedianCVCoverage, Read Depth
+
+### PCA by Study, Treatment
+
+### Modeling
+
+### Results
+
+
+
