@@ -1,0 +1,432 @@
+---
+title: "10X Analysis Template: TCRs"
+output: html_notebook
+author: "Kirsten Diggins"
+---
+
+This template provides code to read, process, and plot TCR counts from 10X analysis. Code for TCR data reading and pre-processing was written by Hannah DeBurg, and airline plot code was written by Matt Dufort. 
+
+## Workflow:
+1. Load and process TCR counts; get QC plots.
+2. Merge TCR libs and run tcrGraph to get clonotypes.
+3. Merge TCR data with GEX data for data exploration.
+4. Plots to explore clonal expansion.
+
+
+```{r load_libraries, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggthemes)
+library(ggbeeswarm)
+library(viridis)
+library(stringr)
+library(readxl)
+library(kableExtra)
+library(RColorBrewer)
+library(plotly)
+library(tidyr)
+library(gtools)
+library(apird) #API for the research database
+#library(devtools)  #if needed to obtain github packages
+# install_github('mjdufort/TCRtools') #if needed to get Matt Dufort's package
+library(TCRtools) 
+# library(annotables)
+#devtools::install_github("stephenturner/annotables")
+library(RNAseQC) #install_github('benaroyaresearch/RNAseQC')
+library(data.table)
+library(edgeR)
+library(ggrepel)
+library(ComplexHeatmap)
+library(geneSetTools) # For barcode plots
+library(egg) #For ggarrange
+library(ggpubr) #Also for ggarrange
+library(DGETools) #install_github('benaroyaresearch/DGETools')
+library(inlmisc) #For colors
+library(umap)
+library(tcrGraph)
+library(igraph)
+library(forcats)
+library(ggalluvial)
+library(Seurat)
+library(monocle3)
+```
+
+## Load and process TCR counts; get QC plots
+
+This TCR pre-processing code was adapted from code provided to me by Hannah DeBurg.
+
+```{r get_data_and_dirs}
+## Set path to data files
+file_path = "my_path/"
+
+## Load annotation file
+load(file_path,"project annotation.Rdata") ## project_anno
+
+## Load GEX data (cds object; post-processing with cluster and trajectory information)
+load(paste0(file_path,"cds_object.Rdata"))
+
+## Filter annotation to just TCR libraries
+tcr_anno <- project_anno %>% dplyr::filter(libraryProtocolId=="next_gem_sc_5prime_10x_genomics_tcr_enriched") 
+```
+
+```{r read_10x_tcr_data}
+## Get TCR library IDs
+libs <- tcr_anno %>% dplyr::select(libid)
+libs <- as.vector(libs$libid)
+
+tcr_files <- file.path(data_dir, "individualLibraryResults","tcr", paste0(libs, "_all_contig_annotations.csv"))
+clonotype_files <- file.path(data_dir, "individualLibraryResults","tcr", paste0(libs, "_clonotypes.csv"))
+tcr_qc_files <- file.path(data_dir, "individualLibraryResults","tcr", paste0(libs, "_metrics_summary.csv"))
+
+unpack_file <- function(file_in){
+  
+  data <- read.csv(file_in)
+  data$libid <- str_extract(file_in, "lib[0-9]+")
+  
+  return(data)
+  
+}
+
+tcrs_list <- lapply(tcr_files, unpack_file)
+tcrs <- bind_rows(tcrs_list)
+
+clonotypes_list <- lapply(clonotype_files, unpack_file)
+clonotypes <- bind_rows(clonotypes_list)
+
+## Extract and bind all tcr metrics
+tcr_metrics <- lapply(tcr_qc_files, unpack_file)
+
+## Fix character conversion of estimated number of cells in files
+make_char_numeric <- function(file_in){
+  in_file <- file_in
+  in_file$Estimated.Number.of.Cells <- as.numeric(str_remove(in_file$Estimated.Number.of.Cells,","))
+  in_file$Number.of.Cells.With.Productive.V.J.Spanning.Pair <- as.numeric(str_remove(in_file$Number.of.Cells.With.Productive.V.J.Spanning.Pair,","))
+  
+  return(in_file)
+}
+
+tcr_metrics <- lapply(tcr_metrics,make_char_numeric)
+
+tcr_metrics <- bind_rows(tcr_metrics)
+```
+
+# Data quality metrics
+
+```{r tcr_quality_cleaning}
+make_pct_numeric <- function(pct_column){
+  
+  num_column <- pct_column %>%
+    str_remove_all("%") %>%
+    as.numeric() 
+  num_column <- num_column/100
+  
+  return(num_column)
+}
+
+tcr_metrics <- tcr_metrics %>%
+  dplyr::mutate(Reads.Mapped.to.Any.V.D.J.Gene = make_pct_numeric(Reads.Mapped.to.Any.V.D.J.Gene),
+                Cells.With.Productive.TRA.Contig = make_pct_numeric(Cells.With.Productive.TRA.Contig),
+                Cells.With.Productive.TRB.Contig = make_pct_numeric(Cells.With.Productive.TRB.Contig))
+
+tcr_anno_metrics <- merge(tcr_anno,tcr_metrics,by="libid")
+```
+
+# Get TCR metrics plots
+
+```{r}
+ggplot(tcr_anno_metrics) +
+  geom_col(aes(x = participantID,
+                 y = Reads.Mapped.to.Any.V.D.J.Gene,
+               fill = participantID))+
+  labs(x = "",
+       y = "Reads mapped to V/D/J genes")
+```
+
+```{r}
+ggplot(tcr_anno_metrics) +
+  geom_col(aes(x = participantID,
+                 y = Cells.With.Productive.TRA.Contig,
+               fill = participantID))+
+  labs(x = "",
+       y = "Cells with a productive TRA contig")
+```
+
+```{r}
+ggplot(tcr_anno_metrics) +
+  geom_col(aes(x = participantID,
+                 y = Cells.With.Productive.TRB.Contig,
+               fill = participantID))+
+  labs(x = "",
+       y = "Cells with a productive TRB contig")
+```
+
+```{r clonotype_freq}
+n_clones <- 10
+
+#Plot the n most frequent clonotypes 
+top_clones <- clonotypes %>%
+  dplyr::filter(clonotype_id %in% paste0("clonotype", seq(1,n_clones,1))) %>%
+  dplyr::mutate(clonotype_num  = str_extract(clonotype_id, "[0-9]+"),
+                clonotype_num = factor(clonotype_num, levels = mixedsort(unique(clonotype_num))))
+
+n_unique_clones <- length(unique(top_clones$cdr3s_aa))
+
+top_clones %>%
+  ggplot(aes(x=clonotype_num, 
+             y = proportion,
+             fill = cdr3s_aa))+ 
+  geom_col()+
+   scale_fill_manual(values = as.vector(GetColors(n_unique_clones, "smooth rainbow")),
+                     guide = F)+
+  scale_y_continuous(labels = scales::percent)+
+  labs(x = "Clonotype number",
+       y = "Percent of cells")
+
+```
+
+```{r save_TCR_data}
+# save(tcrs,file=paste0(file_path,"per-cell TCR data - postQC.Rdata"))
+```
+
+## Merge TCR libs and run tcrGraph to get clonotypes
+
+```{r load_saved_tcr_data, message=FALSE, warning=FALSE}
+## Load per-cell, post-QC TCR data (generated by code above)
+# load(paste0(file_path,"per-cell TCR data - postQC.Rdata"))
+
+## Load project annotation if not loaded above
+# load(paste0(file_path,"annotation.Rdata"))
+# anno_data <- project_anno
+```
+
+Library IDs may be repeated across flow cells, so to be sure that each cell has a unique ID, first append cell barcode to donor ID and rename to "libid" (for use in tcrGraph). 
+
+```{r get_TCR_libs}
+## Relabel cells with barcode_DonorID to ensure unique cell IDs across samples.
+anno_to_merge <- anno_data %>% dplyr::rename(Donor.ID = participantID) %>% select(libid, Donor.ID) 
+
+all_libs_tcrs <-  tcrs %>% 
+  dplyr::filter(is_cell=="True", productive=="True", cdr3 != "None") %>%  ## keep cells with productive TCR sequences
+  merge(anno_to_merge) %>%
+  dplyr::rename(Original.Lib.ID = libid) %>% 
+  mutate(libid = paste(barcode,Donor.ID,sep="_"))
+```
+
+# Run tcrGraph on combined samples to get global clonotype definitions. 
+
+```{r run_tcrGraph}
+## Run TCR graph to get global clonotype definitions across samples.
+tcr_graph_output_all = tcrGraph::makeTcrGraph(all_libs_tcrs,link="cdr3_nt")
+
+tcrGraph_clones_all <- tcrGraph::getClonesFromTcrGraph(tcr_graph_output_all, link = "cdr3_nt")
+
+# length(unique(tcrGraph_clones_all$cloneId)) ## check number of clonotypes identified
+
+tcrGraph::makeVisNetwork(tcr_graph_output_all)
+```
+
+
+## Merge TCR info with GEX data for data exploration
+
+Add back tcrGraph clonotype ID to cds colData for plotting:
+
+```{r get_cloneIDs}
+all_cloneID_data = data.frame(barcode_donorID = NULL, 
+                             Donor.ID = NULL,
+                             barcode = NULL, 
+                             cloneID = NULL, 
+                             clone_count = NULL)
+
+for(i in 1:length(unique(tcrGraph_clones_all$cloneId))){
+  single_clone_data <- tcrGraph_clones_all[i,] 
+  
+  ## Extract IDs
+  both_IDs = unlist(str_split(single_clone_data$libs, ", "))
+  Donor.IDs =  sapply(strsplit(both_IDs, "_"), `[`, 2)
+  barcodes_long = sapply(strsplit(both_IDs, "_"), `[`, 1)
+  barcodes = sapply(strsplit(barcodes_long,"-"), `[`, 1)
+  
+  ## Build single clone data frame
+  single_clone <- data.frame(barcode_donorID = both_IDs, 
+                             Donor.ID = Donor.IDs,
+                             barcode = barcodes, 
+                             cloneID = single_clone_data$cloneId, 
+                             clone_count = single_clone_data$cloneCounts)
+  
+  all_cloneID_data <- bind_rows(all_cloneID_data,single_clone)
+}
+```
+
+
+```{r merge_cds_and_TCR_clonotypes}
+## Merge TCR clone IDs with cds colData
+colData(cds_all)$barcode_original <- row.names(colData(cds_all))
+
+cds_metadata <- colData(cds_all) %>% 
+  as.data.frame() %>% 
+  select(Donor.ID, Response, cluster, barcode_original)
+
+cds_metadata$barcode <-  sapply(strsplit(cds_metadata$barcode_original,"-"), `[`, 1)
+
+cds_metadata_with_clones <- left_join(cds_metadata,
+                                      all_cloneID_data, 
+                                      by=c("barcode","Donor.ID"))
+
+colData(cds_all)$cloneID <- cds_metadata_with_clones$cloneID
+colData(cds_all)$clone_count <- cds_metadata_with_clones$clone_count
+colData(cds_all)$barcode_donorID <- cds_metadata_with_clones$barcode_donorID
+```
+
+## Plots for data exploration
+
+# UMAP plot of cells colored by expansion
+
+Add heat intensity overlay for TCR-expressing cells on UMAP based on clonal expansion.
+
+```{r plot_expansion}
+## Replace NA with 0 for clone counts
+clone_counts <- colData(cds_all)$clone_count
+clone_counts[is.na(clone_counts)] <- 0
+colData(cds_all)$clone_count_numeric <- clone_counts
+cds_metadata_ordered <- colData(cds_all) %>% 
+  as.data.frame() %>% 
+  arrange(clone_count_numeric,) ## reorder so cells with highest clone count are on top
+
+cds_all_ordered <- cds_all[,cds_metadata_ordered$barcode_original]
+plot_cells(cds_all_ordered,
+           color_cells_by="clone_count",
+           show_trajectory_graph = F, 
+           cell_size=2) 
+```
+
+# Circos plots
+
+Create circos plots where each segment is a cluster. This produces a separate plot per individual. If there are many shared clones, consider downsampling connections for plotting or only display connections between a subset of clusters at a time. 
+
+```{r get_circos_plots}
+## Set up color palette
+Monocle3_palette <- c("#28B34B","#F3756D","#D29329","#92AB3C","#2CB99C","#E66AA8","#05B9E3","#6F94CD","#B47BB5")
+palette(Monocle3_palette)
+
+## Optional - subset only specific clusters for drawing TCR connections
+anno_for_circos <- colData(cds_all) %>% as.data.frame() %>% dplyr::filter(cluster %in% c(5,6,7)) %>% select(barcode_donorID,Response,cluster)
+
+## Subset TCR data to only specific clusters defined in line above
+TCRs_for_circos <- all_libs_tcrs %>% merge(anno_for_circos,by.x="libid",by.y="barcode_donorID") 
+
+pdf(file=paste0(file_path,'circos plots.pdf'))
+par(mfrow=(c(3,4))) ## specify rows/columns of output pdfs
+
+TCR_circos_anno <- TCRs_for_circos %>% select(libid,cluster,Response) %>% unique() %>% dplyr::rename(barcode_donorID=libid)
+circos_plots <- list()
+
+for(i in 1:length(unique(all_cloneID_data$Donor.ID))){
+all_cloneID_data_for_plot <- all_cloneID_data %>% 
+  merge(TCR_circos_anno,by="barcode_donorID") %>%
+  dplyr::rename(tcr1=barcode_donorID) %>% 
+  filter(Donor.ID==unique(all_cloneID_data$Donor.ID)[i]) %>%
+  arrange(cluster)
+
+all_cloneID_data_for_plot$cluster <- as.character(all_cloneID_data_for_plot$cluster)
+
+## Downsample number of connections to plot (alternative to plotting only a subset of clusters' clonotype sharing)
+# all_cloneID_data_for_plot <- all_cloneID_data_for_plot[sample(row.names(all_cloneID_data_for_plot),100,replace = F),] %>%
+  # arrange(cluster)
+
+all_cloneID_data_for_plot <- all_cloneID_data_for_plot %>% arrange(cluster)
+TCR_match <- TCRtools::match_TCR_chains(all_cloneID_data_for_plot,id_col= "tcr1", junction_col = "cloneID", match_V_gene=F, match_J_gene=F)
+tab_shared_TCR <- tabulate_shared_TCR_chains(TCR_match)
+tab_shared_TCR$color <- "black"
+
+circos_plots[[i]] <- plot_TCR_circos(tcr_cells=all_cloneID_data_for_plot,tab_shared_TCR,ring_colors="cluster",link_colors="color")
+
+## Add legend for cluster ID
+# legend("topleft", legend =paste(unique(all_cloneID_data_for_plot$cluster)), pch=15, pt.cex=3, cex=1.5, bty='n',
+    # col = Monocle3_palette,title = "Cluster")
+
+title(paste0("Donor ",unique(all_cloneID_data$Donor.ID)[i]),line= -1)
+
+}
+
+dev.off()
+# do.call(grid.arrange,c(circos_plots))
+```
+
+# Airline plots - connect cells on UMAP by shared clonotype.
+
+This code was written by Matt Dufort. 
+
+```{r}
+## determine curves to link, based on clone_id_tcr_graph_clonal_expansion
+
+cds_pc_filtered_align_cdr = cds_all[,sample(colnames(cds_all),2000,replace=F)] ## Downsample large data sets
+# make a copy of the annotation plus UMAP coordinates, for easier manipulation
+data.tmp <-
+  as.data.frame(colData(cds_pc_filtered_align_cdr)) %>%
+  cbind(
+    as.data.frame(reducedDims(cds_pc_filtered_align_cdr)$UMAP) %>%
+      magrittr::set_colnames(c("V1", "V2"))) %>% 
+  dplyr::rename("clone_id_tcr_graph_clonal_expansion" = "cloneID")
+
+# create data frame to store links
+curves.tmp <-
+  data.frame(
+    clone_id_tcr_graph_clonal_expansion = character(),
+    x = numeric(),
+    y = numeric(),
+    xend = numeric(),
+    yend = numeric())
+
+# loop over each clone, and extract coordinates for cells from the same clone
+for (clone_id.tmp in na.omit(unique(data.tmp$clone_id_tcr_graph_clonal_expansion))) {
+  clone_id_curves.tmp <- curves.tmp[0,]
+  data_for_curves.tmp <-
+    data.tmp %>%
+    dplyr::filter(clone_id_tcr_graph_clonal_expansion %in% clone_id.tmp)
+  if (nrow(data_for_curves.tmp) > 1) {
+    for (i in 1:(nrow(data_for_curves.tmp)-1)) {
+      for (j in (i+1):nrow(data_for_curves.tmp)) {
+        clone_id_curves.tmp <-
+          rbind(
+            clone_id_curves.tmp,
+            list(
+              clone_id_tcr_graph_clonal_expansion =
+                data_for_curves.tmp$clone_id_tcr_graph_clonal_expansion[i],
+              x = data_for_curves.tmp$V1[i],
+              y = data_for_curves.tmp$V2[i],
+              cluster1 = data_for_curves.tmp$cluster[i],
+              xend = data_for_curves.tmp$V1[j],
+              yend = data_for_curves.tmp$V2[j],
+              cluster2 = data_for_curves.tmp$cluster[j]))
+      }
+    }
+  }
+  curves.tmp <-
+    rbind(curves.tmp, clone_id_curves.tmp)
+}
+
+# code to color the curves by averaging the colors of the clusters
+# not used; does not work if coloring the points, as ggplot does not easily allow two separate color palettes
+pal.cluster_renumbered = toupper(c('#a6cee3','#1f78b4','#b2df8a','#33a02c','#fb9a99','#e31a1c','#fdbf6f','#ff7f00','#cab2d6','#6a3d9a','#ffed6f','#b15928', "gray","black","blue","red")) 
+curves.tmp$curve_color <- as.character(NA)
+for (i in 1:nrow(curves.tmp)) {
+  curves.tmp$curve_color[i] <-
+    average_colors(
+      c(pal.cluster_renumbered[as.character(curves.tmp$cluster1[i])],
+        pal.cluster_renumbered[as.character(curves.tmp$cluster2[i])]))
+}
+
+# make the plot
+plot_cells(
+  cds_pc_filtered_align_cdr,
+  color_cells_by = "cluster", cell_size=1, show_trajectory_graph = FALSE,
+  group_label_size=8) +
+  scale_color_manual(values=pal.cluster_renumbered) +
+  geom_curve(
+    data = curves.tmp,
+    mapping = aes(x=x, y=y, xend=xend, yend=yend),
+    size = 0.07,
+    alpha=0.5) 
+```
+
+
+

@@ -1,0 +1,275 @@
+---
+title: "10X Analysis Template: GEX analysis"
+output: html_notebook
+author: "Kirsten Diggins"
+---
+
+10X analysis with Seurat and Monocle3 - references: 
+Monocle3: https://cole-trapnell-lab.github.io/monocle3/docs/starting/
+Seurat: https://satijalab.org/seurat/vignettes.html
+
+## Workflow:
+1. Load data through Seurat and perform preliminary QC analysis.
+2. Convert Seurat object to a cell data set (cds) object for use with Monocle3
+3. Normalize and reduce dimensions, then plot to identify any batch effects or other quality issues. 
+4. Apply batch correction, gate out "junk" or unwanted cells.
+5. Rerun dimensionality reduction, cluster data, and run trajectory analysis.
+6. Find top markers per cluster. 
+
+## Load data and perform preliminary QC
+
+```{r load_libraries, message=FALSE, warning=FALSE}
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(monocle3)
+library(scater)
+library(apird)
+library(stringr)
+library(ggpubr)
+library(gridExtra)
+library(car)
+library(lme4)
+library(garnett)
+
+file_path = "output directory path/"
+
+## High contrast color palette
+pal = toupper(c('#a6cee3','#1f78b4','#b2df8a','#33a02c','#fb9a99','#e31a1c','#fdbf6f','#ff7f00','#cab2d6','#6a3d9a','#ffed6f','#b15928'))    
+
+## Define list of known genes of interest
+gene_list <- c("TIGIT","KLRG1","CCR7","TCF7")
+```
+
+```{r load_data_and_get_qc_plots}
+project_anno <- apird::getAnno("pid")
+
+## Read filtered feature matrix using Read10X - pull data directly from the server
+all.data <- Read10X("path_on_server/filtered_feature_bc_matrix")
+
+## Create Seurat Object
+aggr <- CreateSeuratObject(counts = all.data, min.features = 100, min.cells = 3, project = "pid")
+
+## Add mitochondrial gene % to metadata
+aggr[["percent.mt"]] <- PercentageFeatureSet(aggr, pattern = "^MT-") 
+
+VlnPlot(aggr, 
+        features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), 
+        ncol = 3) 
+```
+
+Choose thresholds based on quality plots. An alternative to a hard cutoff on percent.mt is to manually gate out the percent.mt-high population from the UMAP plot.
+
+```{r apply_cutoffs}
+aggr_postQC <- subset(aggr, 
+                      subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 20)
+```
+
+## Convert to cds object for Monocle3
+
+After applying thresholds, convert the Seurat object to a cds object to perform downstream analysis in Monocle3. 
+
+```{r create_cds_object}
+## Merge all per-cell metadata and annotations
+metadata <- read.csv(file=paste0(file.path,"aggregation.csv")) %>%
+  merge(pid_anno,by.x="library_id",by.y="libid") %>%       ## Merge annotation data, including any additional clinical parameters 
+  merge(clinical_data,by="Donor.ID")
+
+gemgroup <- sapply(strsplit(rownames(aggr_postQC@meta.data), split="-"), "[[", 2)
+
+## Create meta data object with project-specific annotation fields
+allmetadata=data.frame(gemgroup=gemgroup,
+                       Lib.ID=metadata[gemgroup,"library_id"],
+                       Donor.ID=metadata[gemgroup,"Donor.ID"],
+                       Pool = metadata[gemgroup,"pool"],
+                       Timepoint = metadata[gemgroup,"timepoint"],
+                       Age = metadata[gemgroup,"Age"],
+                       Time.to.T1D = metadata[gemgroup,"Time.to.T1D"],
+                       T1D.event = metadata[gemgroup,"T1D.event"],
+                       dateCollected = metadata[gemgroup,"dateCollected"],
+                       dateReceived  = metadata[gemgroup,"dateReceived"],
+                       row.names=rownames(aggr_postQC@meta.data))
+
+
+# ## Expression matrix
+final_matrix = GetAssayData(aggr_postQC,assay="RNA",slot="counts")
+
+## Filter cells and genes according to Seurat thresholds
+keep_genes = row.names(final_matrix)
+keep_cells = colnames(final_matrix)
+
+## Cell meta data
+final_meta_data = allmetadata[keep_cells,]
+final_meta_data$Percent.MT <- aggr_postQC$percent.mt
+
+## Gene meta data
+final_gene_data = data.frame(gene_short_name = keep_genes)
+row.names(final_gene_data) <- row.names(final_matrix)
+
+## Combine into cell data set object
+cds <- new_cell_data_set(final_matrix,
+                         cell_metadata = final_meta_data,
+                         gene_metadata = final_gene_data)
+
+```
+
+## Process data and perform additional QC
+
+```{r process_reduceDims_plot}
+cds <- preprocess_cds(cds, num_dim = 100) 
+cds <- reduce_dimension(cds,preprocess_method = "PCA")
+colData(cds)$Percent.MT <- aggr_postQC@meta.data$percent.mt
+plot_cells(cds,color_cells_by="Percent.MT")  ## Plot by clinical or technical features to identify any batch effects or other quality issues. 
+```
+
+
+```{r remove_high_PCT_MT_cells}
+# cds <- choose_cells(cds)  ## exclude high Percent.MT cells if not excluded during Seurat pre-processing
+```
+
+
+```{r batch_correction}
+## Remove batch effects
+## Use residual_model_formula_string for continuous variable batch correction, and alignment_group for discrete variables
+cds_batch_corrected = align_cds(cds, 
+                                num_dim=100, 
+                                alignment_group = "discrete feature with batch effect") #, residual_model_formula_str = "~Percent.MT") 
+
+cds_batch_corrected <- reduce_dimension(cds_batch_corrected) ## reduce dimensions of batch corrected data
+
+plot_cells(cds_batch_corrected,
+           color_cells_by="discrete feature with batch effect") ## check batch correction
+```
+
+## Cluster and run trajectory analysis
+
+```{r reprocess_cluster_plot}
+# cds_to_plot <- choose_cells(cds_batch_corrected) ## Optional - gate to further subset cells for clustering, dim red, trajectory, DE expression analysis
+
+cds_batch_corrected <- cluster_cells(cds_batch_corrected,
+                                     resolution = 3e-5) ## resolution determines cluster number; high resolution --> more clusters
+
+plot_cells(cds_batch_corrected, 
+           color_cells_by="cluster", 
+           show_trajectory_graph = F, 
+           label_cell_groups = F) + 
+  scale_color_manual(values=c(pal))
+```
+
+
+```{r trajectory_analysis}
+## Run trajectory analysis - ncenter and minimal_branch_len can be adjusted to modify trajectory; fewer centers results in a more simplified trajectory
+cds_batch_corrected <- learn_graph(cds_batch_corrected, 
+                                   use_partition=F, close_loop=F,
+                                   learn_graph_control=list(ncenter=150, minimal_branch_len = 5))
+
+plot_cells(cds_batch_corrected,
+           color_cells_by="cluster", 
+           show_trajectory_graph = T) + 
+  scale_color_manual(values=c(pal))
+```
+
+After running the trajectory analysis, you may want to renumber clusters to follow a more intuitive order. This can be done with recode.
+
+```{r recode_cluster_IDs}
+## Recode clusters according to order along trajectory
+# colData(cds_batch_corrected)$cluster <- as.factor(dplyr::recode(colData(cds_batch_corrected)$cluster,
+#                                                  "4" = 1,
+#                                                  "2" = 2,
+#                                                  "1" = 3,
+#                                                  "3" = 4,
+#                                                  "5" = 5,
+#                                                  "6" = 6))
+```
+
+## Find top markers defining each cluster
+
+```{r top_markers}
+## Finds top differentially expressed markers per cluster.
+## This function can take a long time to run depending on data size; save output for faster access later
+## See ?top_markers for more parameter details
+
+# load(paste0(file_path,"top marker test result.Rdata")) ## load previously run top marker results
+marker_test_res <- top_markers(cds_batch_corrected,
+                               group_cells_by="cluster",
+                               genes_to_test_per_group = 500,
+                               reference_cells=1000)
+
+# save(marker_test_res,file=paste0(file_path,"top marker test result.Rdata"))
+
+## Subset top markers to top_n per cluster; default = 5 markers per cluster
+top_specific_markers <- marker_test_res %>%
+                            filter(fraction_expressing >= 0.10) %>%
+                            group_by(cell_group) %>%
+                            top_n(5, pseudo_R2)
+
+
+## Plot heatmap of top markers per cluster
+plotHeatmap(cds_batch_corrected, 
+            order_columns_by="cluster",
+            # cluster_cols = T,
+            exprs_values = 1,
+            by_exprs_values = 1,
+            center=T,
+            zlim = c(0,6),
+            features=unique(top_specific_markers$gene_id),
+            show_colnames = F) 
+```
+
+# Additional plots for data exploration:
+
+```{r feature_plots}
+## Plot cells in UMAP space and color by gene(s)
+plot_cells(cds_batch_corrected,
+           genes=gene_list, 
+           label_cell_groups = F)
+```
+
+```{r UMAP_clusters_and_genes}
+## Plot clusters alongside genes on UMAP
+plot_cells(cds_batch_corrected, 
+           color_cells_by = "cluster", 
+           label_cell_groups = F, 
+           show_trajectory_graph = T, 
+           cell_size = 1) + scale_color_manual(values=c(pal)) +
+  plot_cells(cds_batch_corrected, 
+             genes = gene_list, 
+             show_trajectory_graph = F, 
+             cell_size=1, 
+             label_cell_groups = F)
+```
+
+```{r facet_grid_variables}
+## Plot UMAP by group with facet grid to split cells out by group (e.g. Donor.ID or time point)
+plot_cells(cds_batch_corrected,
+           color_cells_by="Donor.ID", 
+           label_cell_groups = F,cell_size=2) +
+  facet_grid(cols=vars(Donor.ID), 
+             rows=vars(Timepoint)) + 
+  scale_color_manual(values=c(pal))
+```
+
+```{r UMAP_with_density_contours}
+## Plot UMAP with density contours, split out by variable (e.g. clinical group or time point)
+plot_cells(cds_batch_corrected, 
+           color_cells_by = "Timepoint",
+           show_trajectory_graph = F,
+           cell_size = 1.5,
+           alpha = 0.9,
+           label_cell_groups = F) + facet_wrap(~ Timepoint, ncol=3) + geom_density2d(colour="black")
+```
+
+```{r dot_plot_gene_expr}
+## Dot plot of gene expression by group or cluster
+plot_genes_by_group(cds_batch_corrected,
+                    gene_list,
+                    group_cells_by="cluster",
+                    ordering_type="maximal_on_diag",
+                    max.size=6)
+```
+
+```{r save_cds_object}
+## Save cds object for future analysis. This saved cds object is used as input for 10X TCR analysis template.
+# save(cds_batch_corrected,file=paste0(file_path,"cds_object.Rdata"))
+```
+
